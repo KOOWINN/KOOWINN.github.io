@@ -577,3 +577,126 @@ private Producer<CloseableReference<CloseableImage>> getBasicDecodedImageSequenc
 可见，ProducerSequenceFactory可以根据请求的图片数据源类型生成不同的Producer序列。例如，如果要从网络获取图片，其Producer序列需通过`getNetworkFetchSequence`方法生成，具体为：
 
 ![加载网络图片的Produer序列图](images/加载网络图片的Producer序列图.png)
+
+需要注意的是，Producer序列在生成时并不是简单地将每个Producer依次链接起来，还会进行额外的操作：当一个Producer A传递给下一个Producer B时，Producer B会对Producer A配套的Consumer A进行包装，从而生成了新的Consumer B，这样就可以对Consumer A中的结果再做一层处理。这里用到了装饰器模式：
+
+>装饰器模式：动态地给一个对象增加一些额外的职责(Responsibility)，就增加对象功能来说，装饰模式比生成子类实现更为灵活。其别名也可以称为包装器(Wrapper)。存在以下四种角色：
+- 抽象构件角色：给出一个抽象接口，以规范准备接受附加责任的对象。
+- 具体构件角色：定义准备接受附加责任的对象。
+- 抽象装饰角色：持有一个构件对象的实例，并对应一个与抽象构件接口一致的接口。
+- 具体装饰角色：负责给具体构件加上额外的责任。
+
+Consumer类的抽象装饰器类就是DelegatingConsumer类：
+```java
+public abstract class DelegatingConsumer<I, O> extends BaseConsumer<I> {
+
+  private final Consumer<O> mConsumer;
+
+  public DelegatingConsumer(Consumer<O> consumer) {
+    mConsumer = consumer;
+  }
+
+  public Consumer<O> getConsumer() {
+    return mConsumer;
+  }
+
+  @Override
+  protected void onFailureImpl(Throwable t) {
+    mConsumer.onFailure(t);
+  }
+
+  @Override
+  protected void onCancellationImpl() {
+    mConsumer.onCancellation();
+  }
+
+  @Override
+  protected void onProgressUpdateImpl(float progress) {
+    mConsumer.onProgressUpdate(progress);
+  }
+}
+```
+
+例如，在PostprocessorProducer中会接受另一个Producer，并对它的Consumer做如下包装：
+```Java
+public class PostprocessorProducer implements Producer<CloseableReference<CloseableImage>> {
+
+  private final Producer<CloseableReference<CloseableImage>> mInputProducer;
+
+  @Override
+  public void produceResults(
+      final Consumer<CloseableReference<CloseableImage>> consumer, ProducerContext context) {
+    ......
+    final PostprocessorConsumer basePostprocessorConsumer =
+        new PostprocessorConsumer(consumer, listener, postprocessor, context);
+    final Consumer<CloseableReference<CloseableImage>> postprocessorConsumer;
+    ......
+    mInputProducer.produceResults(postprocessorConsumer, context);
+  }
+
+  private class PostprocessorConsumer
+      extends DelegatingConsumer<
+          CloseableReference<CloseableImage>, CloseableReference<CloseableImage>> {
+
+    ......
+
+    public PostprocessorConsumer(
+        Consumer<CloseableReference<CloseableImage>> consumer,
+        ProducerListener2 listener,
+        Postprocessor postprocessor,
+        ProducerContext producerContext) {
+      super(consumer);
+      ......
+    }
+
+    @Override
+    protected void onNewResultImpl(
+        CloseableReference<CloseableImage> newResult, @Status int status) {
+      ......
+      updateSourceImageRef(newResult, status);
+    }
+
+    @Override
+    protected void onFailureImpl(Throwable t) {
+      maybeNotifyOnFailure(t);
+    }
+
+    @Override
+    protected void onCancellationImpl() {
+      maybeNotifyOnCancellation();
+    }
+
+    private void updateSourceImageRef(
+        @Nullable CloseableReference<CloseableImage> sourceImageRef, int status) {
+      CloseableReference<CloseableImage> oldSourceImageRef;
+      boolean shouldSubmit;
+      ......
+      if (shouldSubmit) {
+        submitPostprocessing();
+      }
+    }
+
+    ......
+
+    private void maybeNotifyOnNewResult(CloseableReference<CloseableImage> newRef, int status) {
+      boolean isLast = isLast(status);
+      if ((!isLast && !isClosed()) || (isLast && close())) {
+        getConsumer().onNewResult(newRef, status);
+      }
+    }
+
+    private void maybeNotifyOnFailure(Throwable throwable) {
+      if (close()) {
+        getConsumer().onFailure(throwable);
+      }
+    }
+
+    private void maybeNotifyOnCancellation() {
+      if (close()) {
+        getConsumer().onCancellation();
+      }
+    }
+    ......
+  }
+}
+```
